@@ -1,0 +1,1 @@
+# stm32cubemx2_start_project_with_previous_HAL2_version
