@@ -16,11 +16,14 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 EXPECTED_LIST_FILE="$TMP_DIR/expected.list"
 INSTALLED_LIST_FILE="$TMP_DIR/installed.list"
+
 TO_REMOVE_FILE="$TMP_DIR/to_remove.list"
+TO_REMOVE_METADATA_FILE="$TMP_DIR/to_remove_metadata.list"
 TO_INSTALL_FILE="$TMP_DIR/to_install.list"
 PLAN_FILE="$TMP_DIR/plan.list"
 
 removed_count=0
+metadata_removed_count=0
 installed_count=0
 already_ok_count=0
 skipped_count=0
@@ -74,18 +77,9 @@ version_ge() {
 
     [[ "$(printf '%s\n%s\n' "$n2" "$n1" | sort -V | tail -n1)" == "$n1" ]]
 }
+
 disable_pdsc_sync_on_startup() {
-    # if [[ ! -f "$SETTINGS_FILE" ]]; then
-        # log "Warning: settings file not found: $SETTINGS_FILE"
-        # return 0
-    # fi
-
-    # cp "$SETTINGS_FILE" "$BACKUP_FILE"
-    # sed -i 's/"cube\.cube-core\.sync-pdsc-repositories-on-startup":[[:space:]]*true/"cube.cube-core.sync-pdsc-repositories-on-startup": false/g' "$SETTINGS_FILE"
-
-    # log "File updated: $SETTINGS_FILE"
-    # log "Backup created: $BACKUP_FILE"
-	local settings_dir
+    local settings_dir
     settings_dir="$(dirname "$SETTINGS_FILE")"
 
     if [[ ! -d "$settings_dir" ]]; then
@@ -135,7 +129,6 @@ EOF
         mv "${SETTINGS_FILE}.tmp" "$SETTINGS_FILE"
         log "Setting added to: $SETTINGS_FILE"
     fi
-	
 }
 
 install_pack_manager() {
@@ -204,28 +197,48 @@ load_expected_data() {
 }
 
 get_installed_packs() {
-    cube pack list packs | awk -F ' - ' 'NF >= 1 && $1 != "" {print $1}'
+    cube pack list packs | awk -F ' - ' '
+    {
+        gsub(/\r/, "", $0)
+
+        pack_id = $1
+        sub(/^[[:space:]]+/, "", pack_id)
+        sub(/[[:space:]]+$/, "", pack_id)
+        if (pack_id == "") {
+            next
+        }
+
+        state = "installed"
+        if (tolower($0) ~ /metadata[[:space:]]+only/) {
+            state = "metadata_only"
+        }
+
+        if (!(pack_id in states) || state == "installed") {
+            states[pack_id] = state
+        }
+    }
+    END {
+        for (pack_id in states) {
+            print pack_id "|" states[pack_id]
+        }
+    }
+    '
 }
 
 parse_installed_packs() {
-    get_installed_packs | awk '
+    get_installed_packs | awk -F'|' '
     {
-        line=$0
+        line=$1
+        state=$2
         gsub(/\r/, "", line)
 
-        # 1. Find where the version starts (first digit after a dot)
-        # Match a dot followed by a digit, for example: .2 or .12
         if (!match(line, /\.[0-9]/)) {
             next
         }
 
-        # index_version is the position of the dot before the first digit
         index_version = RSTART
-
-        # 2. Extract the "vendor and name" part (everything before the version)
         prefix = substr(line, 1, index_version - 1)
 
-        # Split vendor from the rest of the name
         n = split(prefix, prefix_parts, ".")
         if (n < 2) {
             next
@@ -233,16 +246,14 @@ parse_installed_packs() {
 
         vendor = prefix_parts[1]
 
-        # Rebuild the full name in case it contains dots
         name = prefix_parts[2]
         for (i = 3; i <= n; i++) {
             name = name "." prefix_parts[i]
         }
 
-        # 3. Extract the version (everything starting from the first digit)
         version = substr(line, index_version + 1)
 
-        print vendor "|" name "|" version
+        print vendor "|" name "|" version "|" state
     }
     ' | sort -u
 }
@@ -252,7 +263,8 @@ load_installed_data() {
 
     parse_installed_packs > "$INSTALLED_LIST_FILE"
 
-    log "Number of installed packs detected: $(wc -l < "$INSTALLED_LIST_FILE" | tr -d ' ')"
+    log "Installed packs detected: $(awk -F'|' '$4=="installed"{c++} END{print c+0}' "$INSTALLED_LIST_FILE")"
+    log "Metadata-only entries detected: $(awk -F'|' '$4=="metadata_only"{c++} END{print c+0}' "$INSTALLED_LIST_FILE")"
     phase_end
 }
 
@@ -277,18 +289,25 @@ compute_sync_plan() {
         vendor=$1
         name=$2
         version=$3
+        state=$4
 
         vn=vendor "|" name
         fn=vendor "|" name "|" version
 
-        installed[fn]=1
+        if (state == "installed") {
+            installed[fn]=1
+        }
 
         if (!(vn in expected_vendor)) {
-            print "KEEP|" fn
+            print "KEEP|" fn "|" state
         } else if (!(fn in expected_full)) {
-            print "REMOVE|" fn
-        } else {
-            print "OK|" fn
+            if (state == "metadata_only") {
+                print "REMOVE_METADATA|" fn "|" state
+            } else {
+                print "REMOVE|" fn "|" state
+            }
+        } else if (state == "installed") {
+            print "OK|" fn "|" state
         }
     }
     END {
@@ -301,18 +320,120 @@ compute_sync_plan() {
     ' "$EXPECTED_LIST_FILE" "$INSTALLED_LIST_FILE" > "$PLAN_FILE"
 
     awk -F'|' '$1=="REMOVE"{print $2 "|" $3 "|" $4}' "$PLAN_FILE" | sort -u > "$TO_REMOVE_FILE"
+    awk -F'|' '$1=="REMOVE_METADATA"{print $2 "|" $3 "|" $4}' "$PLAN_FILE" | sort -u > "$TO_REMOVE_METADATA_FILE"
     awk -F'|' '$1=="INSTALL"{print $2 "|" $3 "|" $4 "|" $5}' "$PLAN_FILE" | sort -u > "$TO_INSTALL_FILE"
 
-    already_ok_count="$(awk -F'|' '$1=="OK" || $1=="KEEP"{c++} END{print c+0}' "$PLAN_FILE")"
+    already_ok_count="$(awk -F'|' '$1=="OK" || ($1=="KEEP" && $5=="installed"){c++} END{print c+0}' "$PLAN_FILE")"
 
-    log "Packs to remove   : $(wc -l < "$TO_REMOVE_FILE" | tr -d ' ')"
-    log "Packs to install  : $(wc -l < "$TO_INSTALL_FILE" | tr -d ' ')"
-    log "Packs already OK  : $already_ok_count"
+    log "Packs to remove           : $(wc -l < "$TO_REMOVE_FILE" | tr -d ' ')"
+    log "Metadata-only to clean    : $(wc -l < "$TO_REMOVE_METADATA_FILE" | tr -d ' ')"
+    log "Packs to install          : $(wc -l < "$TO_INSTALL_FILE" | tr -d ' ')"
+    log "Packs already OK          : $already_ok_count"
 
     phase_end
 }
 
+remove_packs_with_cleanup() {
+    local pack_id
+    local pack_count="$#"
+    local cleanup_failed
+    local failed_count=0
+
+    if [[ "$NO_REMOVE" == "true" ]]; then
+        log "Pack removal, cache and metadata cleanup disabled because NO_REMOVE=true"
+        return 0
+    fi
+
+    if [[ "$pack_count" -eq 0 ]]; then
+        return 0
+    fi
+
+    log "Removing $pack_count pack(s) with pack-manager."
+
+    if ! run_cmd cube mx pack-manager remove --pack-ids "$@"; then
+        skipped_count=$((skipped_count + pack_count))
+        log "WARNING: batch removal failed; cache and metadata cleanup not attempted."
+        return 1
+    fi
+
+    removed_count=$((removed_count + pack_count))
+
+    for pack_id in "$@"; do
+        cleanup_failed=0
+
+        log "Removing caches for: $pack_id"
+        if ! run_cmd cube pack remove --caches "$pack_id"; then
+            log "WARNING: cache cleanup failed for: $pack_id"
+            cleanup_failed=1
+        fi
+
+        log "Removing metadata for: $pack_id"
+        if ! run_cmd cube pack remove --metadata "$pack_id"; then
+            log "WARNING: metadata cleanup failed for: $pack_id"
+            cleanup_failed=1
+        fi
+
+        if [[ "$cleanup_failed" -eq 0 ]]; then
+            log "Pack removal and cleanup completed: $pack_id"
+        else
+            failed_count=$((failed_count + 1))
+        fi
+    done
+
+    if [[ "$failed_count" -gt 0 ]]; then
+        skipped_count=$((skipped_count + failed_count))
+        log "WARNING: $failed_count removed pack(s) have incomplete cleanup."
+        return 1
+    fi
+
+    return 0
+}
+
+remove_metadata_only_with_cleanup() {
+    local pack_id
+    local cleanup_failed
+    local failed_count=0
+
+    if [[ "$NO_REMOVE" == "true" || "$#" -eq 0 ]]; then
+        return 0
+    fi
+
+    for pack_id in "$@"; do
+        cleanup_failed=0
+
+        log "Removing caches for metadata-only entry: $pack_id"
+        if ! run_cmd cube pack remove --caches "$pack_id"; then
+            log "WARNING: cache cleanup failed for: $pack_id"
+            cleanup_failed=1
+        fi
+
+        log "Removing metadata-only entry: $pack_id"
+        if run_cmd cube pack remove --metadata "$pack_id"; then
+            metadata_removed_count=$((metadata_removed_count + 1))
+        else
+            log "WARNING: metadata cleanup failed for: $pack_id"
+            cleanup_failed=1
+        fi
+
+        if [[ "$cleanup_failed" -ne 0 ]]; then
+            skipped_count=$((skipped_count + 1))
+            failed_count=$((failed_count + 1))
+        fi
+    done
+
+    [[ "$failed_count" -eq 0 ]]
+}
+
 remove_packs() {
+    local pack_ids=()
+    local metadata_ids=()
+    local vendor
+    local name
+    local version
+    local full_pack
+    local pack_count
+    local removal_failed=0
+
     if [[ "$NO_REMOVE" == "true" ]]; then
         log "Pack removal disabled because NO_REMOVE=true"
         return 0
@@ -320,7 +441,7 @@ remove_packs() {
 
     phase_start "Remove outdated packs"
 
-    if [[ ! -s "$TO_REMOVE_FILE" ]]; then
+    if [[ ! -s "$TO_REMOVE_FILE" && ! -s "$TO_REMOVE_METADATA_FILE" ]]; then
         log "No pack to remove."
         phase_end
         return 0
@@ -330,20 +451,63 @@ remove_packs() {
         [[ -z "$vendor" || -z "$name" || -z "$version" ]] && continue
 
         full_pack="${vendor}.${name}.${version}"
+        pack_ids+=("$full_pack")
 
-        log "Removing outdated/non-reference version for known vendor.name: $full_pack"
-        if run_cmd cube pack remove "$full_pack"; then
-		run_cmd cube pack remove --caches "$full_pack";
-		run_cmd cube pack remove --metadata "$full_pack";
-            ((removed_count+=1))
-        else
-            log "WARNING: failed to remove pack: $full_pack"
-            ((skipped_count+=1))
-        fi
+        log "Queued for removal: $full_pack"
     done < "$TO_REMOVE_FILE"
+
+    while IFS='|' read -r vendor name version; do
+        [[ -z "$vendor" || -z "$name" || -z "$version" ]] && continue
+
+        full_pack="${vendor}.${name}.${version}"
+        metadata_ids+=("$full_pack")
+        log "Queued metadata-only entry for cleanup: $full_pack"
+    done < "$TO_REMOVE_METADATA_FILE"
+
+    pack_count="${#pack_ids[@]}"
+
+    if [[ "$pack_count" -eq 0 && "${#metadata_ids[@]}" -eq 0 ]]; then
+        log "No valid pack or metadata-only entry to remove."
+        phase_end
+        return 0
+    fi
+
+    if [[ "$pack_count" -gt 0 ]]; then
+        if remove_packs_with_cleanup "${pack_ids[@]}"; then
+            log "Successfully removed $pack_count pack(s), including caches and metadata."
+        else
+            removal_failed=1
+        fi
+    fi
+
+    if [[ "${#metadata_ids[@]}" -gt 0 ]]; then
+        if remove_metadata_only_with_cleanup "${metadata_ids[@]}"; then
+            log "Successfully cleaned ${#metadata_ids[@]} metadata-only entry/entries."
+        else
+            removal_failed=1
+        fi
+    fi
+
+    if [[ "$removal_failed" -ne 0 ]]; then
+        log "WARNING: pack removal or cleanup failed."
+        phase_end
+        return 1
+    fi
+
+    phase_end
 }
 
 remove_nucleo_c5q1zg_hw_board_v2_or_more() {
+    local pack_ids=()
+    local metadata_ids=()
+    local vendor
+    local name
+    local version
+    local state
+    local full_pack
+    local pack_count
+    local removal_failed=0
+
     if [[ "$NO_REMOVE" == "true" ]]; then
         log "Pack removal disabled because NO_REMOVE=true"
         return 0
@@ -351,37 +515,69 @@ remove_nucleo_c5q1zg_hw_board_v2_or_more() {
 
     phase_start "Remove STMicroelectronics.nucleo-c5q1zg_hw-board > 2.0.0"
 
-    local found=0
-
-    while IFS='|' read -r vendor name version; do
+    while IFS='|' read -r vendor name version state; do
         [[ -z "$vendor" || -z "$name" || -z "$version" ]] && continue
 
-        if [[ "$vendor" == "STMicroelectronics" && "$name" == "nucleo-c5q1zg_hw-board" ]]; then
-            if version_ge "$version" "2.0.0" && [[ "$version" != "2.0.0" ]]; then
-                found=1
-                local full_pack="${vendor}.${name}.${version}"
-                log "Removing forbidden pack version > 2.0.0: $full_pack"
+        if [[ "$vendor" == "STMicroelectronics" &&
+              "$name" == "nucleo-c5q1zg_hw-board" ]]; then
 
-                if run_cmd cube pack remove "$full_pack"; then
-                    run_cmd cube pack remove --caches "$full_pack"
-                    run_cmd cube pack remove --metadata "$full_pack"
-                    ((removed_count+=1))
+            if version_ge "$version" "2.0.0" &&
+               [[ "$version" != "2.0.0" ]]; then
+
+                full_pack="${vendor}.${name}.${version}"
+
+                log "Queued forbidden pack version > 2.0.0: $full_pack"
+                if [[ "$state" == "metadata_only" ]]; then
+                    metadata_ids+=("$full_pack")
                 else
-                    log "WARNING: failed to remove pack: $full_pack"
-                    ((skipped_count+=1))
+                    pack_ids+=("$full_pack")
                 fi
             fi
         fi
     done < <(parse_installed_packs)
 
-    if [[ "$found" -eq 0 ]]; then
+    pack_count="${#pack_ids[@]}"
+
+    if [[ "$pack_count" -eq 0 && "${#metadata_ids[@]}" -eq 0 ]]; then
         log "No STMicroelectronics.nucleo-c5q1zg_hw-board pack with version > 2.0.0 found."
+        phase_end
+        return 0
+    fi
+
+    if [[ "$pack_count" -gt 0 ]]; then
+        if remove_packs_with_cleanup "${pack_ids[@]}"; then
+            log "Successfully removed $pack_count forbidden pack(s), including caches and metadata."
+        else
+            removal_failed=1
+        fi
+    fi
+
+    if [[ "${#metadata_ids[@]}" -gt 0 ]]; then
+        if remove_metadata_only_with_cleanup "${metadata_ids[@]}"; then
+            log "Successfully cleaned ${#metadata_ids[@]} forbidden metadata-only entry/entries."
+        else
+            removal_failed=1
+        fi
+    fi
+
+    if [[ "$removal_failed" -ne 0 ]]; then
+        log "WARNING: forbidden pack removal or cleanup failed."
+        phase_end
+        return 1
     fi
 
     phase_end
 }
 
 install_packs() {
+    local pack_ids=()
+    local vendor
+    local name
+    local version
+    local pack_url
+    local full_pack
+    local pack_count
+
     phase_start "Install expected packs"
 
     if [[ ! -s "$TO_INSTALL_FILE" ]]; then
@@ -395,16 +591,31 @@ install_packs() {
 
         full_pack="${vendor}.${name}.${version}"
 
-        log "Installing: $full_pack"
+        log "Queued for installation: $full_pack"
         log "URL: $pack_url"
 
-        if run_cmd cube pack install "$pack_url"; then
-            ((installed_count+=1))
-        else
-            log "WARNING: installation failed, skipping: $full_pack"
-            ((skipped_count+=1))
-        fi
+        pack_ids+=("$pack_url")
     done < "$TO_INSTALL_FILE"
+
+    pack_count="${#pack_ids[@]}"
+
+    if [[ "$pack_count" -eq 0 ]]; then
+        log "No valid pack to install."
+        phase_end
+        return 0
+    fi
+
+    log "Installing $pack_count pack(s) in one pack-manager operation."
+
+    if run_cmd cube mx pack-manager install --pack-ids "${pack_ids[@]}"; then
+        installed_count=$((installed_count + pack_count))
+        log "Successfully installed $pack_count pack(s)."
+    else
+        skipped_count=$((skipped_count + pack_count))
+        log "WARNING: batch installation failed for $pack_count pack(s)."
+        phase_end
+        return 1
+    fi
 
     phase_end
 }
@@ -455,15 +666,17 @@ print_summary() {
 
     log "===== Summary ====="
     echo
-    echo "PIDX packs       : $(wc -l < "$EXPECTED_LIST_FILE" | tr -d ' ')"
-    echo "Existing packs  : $(wc -l < "$INSTALLED_LIST_FILE" | tr -d ' ')"
-    echo "Packs removed    : $removed_count"
-    echo "Packs installed  : $installed_count"
-    echo "Packs already OK : $already_ok_count"
-    echo "Packs skipped    : $skipped_count"
-    echo "NO_REMOVE        : $NO_REMOVE"
-    echo "DRY_RUN          : $DRY_RUN"
-    echo "Total duration   : ${total_s}s"
+    echo "PIDX packs                : $(wc -l < "$EXPECTED_LIST_FILE" | tr -d ' ')"
+    echo "Installed packs (last scan): $(awk -F'|' '$4=="installed"{c++} END{print c+0}' "$INSTALLED_LIST_FILE")"
+    echo "Metadata only (last scan)  : $(awk -F'|' '$4=="metadata_only"{c++} END{print c+0}' "$INSTALLED_LIST_FILE")"
+    echo "Packs removed              : $removed_count"
+    echo "Metadata-only cleaned      : $metadata_removed_count"
+    echo "Packs installed            : $installed_count"
+    echo "Packs already OK           : $already_ok_count"
+    echo "Packs skipped              : $skipped_count"
+    echo "NO_REMOVE                  : $NO_REMOVE"
+    echo "DRY_RUN                    : $DRY_RUN"
+    echo "Total duration             : ${total_s}s"
     echo
 }
 
@@ -482,8 +695,8 @@ main() {
     compute_sync_plan
     remove_packs
     install_packs
-	remove_nucleo_c5q1zg_hw_board_v2_or_more
-	load_installed_data
+    remove_nucleo_c5q1zg_hw_board_v2_or_more
+    load_installed_data
     create_projects
     print_summary
 
